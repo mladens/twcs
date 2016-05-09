@@ -32,6 +32,9 @@ import java.util.Set;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.*;
+import com.google.common.collect.Range;
+import org.apache.cassandra.dht.*;
+import org.apache.cassandra.io.sstable.Component;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -129,12 +132,6 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
 
     private List<SSTableReader> getNextNonExpiredSSTables(Iterable<SSTableReader> nonExpiringSSTables, final int gcBefore)
     {
-        List<SSTableReader> mostInteresting = getCompactionCandidates(nonExpiringSSTables);
-
-        if (mostInteresting != null)
-        {
-            return mostInteresting;
-        }
 
         // if there is no sstable to compact in standard way, try compacting single sstable whose droppable tombstone
         // ratio is greater than threshold.
@@ -144,10 +141,39 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
             if (worthDroppingTombstones(sstable, gcBefore))
                 sstablesWithTombstones.add(sstable);
         }
-        if (sstablesWithTombstones.isEmpty())
-            return Collections.emptyList();
+        if (!sstablesWithTombstones.isEmpty())
+            return Collections.singletonList(Collections.min(sstablesWithTombstones, new SSTableReader.SizeComparator()));
 
-        return Collections.singletonList(Collections.min(sstablesWithTombstones, new SSTableReader.SizeComparator()));
+
+        List<SSTableReader> mostInteresting = getCompactionCandidates(nonExpiringSSTables);
+
+        if (mostInteresting != null)
+        {
+            return mostInteresting;
+        }
+        else
+        {
+            return Collections.EMPTY_LIST;
+        }
+
+
+    }
+
+    @Override
+    protected boolean worthDroppingTombstones(SSTableReader sstable, int gcBefore) {
+        if (disableTombstoneCompactions)
+            return false;
+        // since we use estimations to calculate, there is a chance that compaction will not drop tombstones actually.
+        // if that happens we will end up in infinite compaction loop, so first we check enough if enough time has
+        // elapsed since SSTable created.
+        if (System.currentTimeMillis() < sstable.getCreationTimeFor(Component.DATA) + tombstoneCompactionInterval * 1000)
+            return false;
+
+        double droppableRatio = sstable.getEstimatedDroppableTombstoneRatio(gcBefore);
+        if (droppableRatio <= tombstoneThreshold)
+            return false;
+
+        return true;
     }
 
     private List<SSTableReader> getCompactionCandidates(Iterable<SSTableReader> candidateSSTables)
@@ -311,6 +337,7 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
             else
             {
                 logger.debug("No compaction necessary for bucket size {} , key {}, now {}", bucket.size(), key, now);
+                //TODO try compacting for tombstones
             }
         }
         return Collections.<SSTableReader>emptyList();
